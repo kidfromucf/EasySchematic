@@ -901,6 +901,11 @@ function SchematicCanvas() {
     (oldEdge: Edge, newConnection: Connection) => {
       reconnectingRef.current = false;
       const state = useSchematicStore.getState();
+      const storeEdge = state.edges.find((e) => e.id === oldEdge.id);
+      if (storeEdge?.data?.linkedConnectionId) {
+        state.reconnectStubbedEdge(oldEdge.id, newConnection);
+        return;
+      }
       const updated = reconnectEdge(oldEdge, newConnection, state.edges);
       useSchematicStore.setState({ edges: updated as typeof state.edges });
       useSchematicStore.getState().saveToLocalStorage();
@@ -915,6 +920,11 @@ function SchematicCanvas() {
       if (reconnectingRef.current) {
         reconnectingRef.current = false;
         const state = useSchematicStore.getState();
+        const storeEdge = state.edges.find((e) => e.id === edge.id);
+        if (storeEdge?.data?.linkedConnectionId) {
+          state.addToast("Stubbed connection was left unchanged", "info");
+          return;
+        }
         useSchematicStore.setState({
           edges: state.edges.filter((e) => e.id !== edge.id),
         });
@@ -1295,6 +1305,15 @@ function SchematicCanvas() {
           if (dn.type === "room") anyRoomMoved = true;
         }
         if (anyRoomMoved) reparentAllDevices({ skipUndo: true });
+        const movedDeviceIds = draggedNodes
+          .filter((n) => n.type === "device")
+          .map((n) => n.id);
+        if (movedDeviceIds.length > 0 || anyRoomMoved) {
+          useSchematicStore.getState().alignStubsToPorts({
+            ...(anyRoomMoved ? {} : { deviceIds: movedDeviceIds }),
+            skipUndo: true,
+          });
+        }
         flushPendingSnapshot();
         return;
       }
@@ -1361,6 +1380,12 @@ function SchematicCanvas() {
       // smallest enclosing room so nested layouts still resolve correctly.
       if (draggedNode.type === "room") {
         reparentAllDevices({ skipUndo: true });
+      }
+      if (draggedNode.type === "device" || draggedNode.type === "room") {
+        useSchematicStore.getState().alignStubsToPorts({
+          ...(draggedNode.type === "device" ? { deviceIds: [draggedNode.id] } : {}),
+          skipUndo: true,
+        });
       }
       flushPendingSnapshot();
     },

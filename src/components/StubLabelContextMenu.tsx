@@ -76,6 +76,22 @@ export default function StubLabelContextMenu() {
     useSchematicStore.setState({ stubLabelContextMenu: null });
   }, [menu]);
 
+  const alignLinkedStubs = useCallback(() => {
+    if (!menu) return;
+    const store = useSchematicStore.getState();
+    const node = store.nodes.find((n) => n.id === menu.nodeId);
+    const linkedId = (node?.data as StubLabelData | undefined)?.linkedConnectionId;
+    if (!linkedId) {
+      useSchematicStore.setState({ stubLabelContextMenu: null });
+      return;
+    }
+    const stubIds = store.nodes
+      .filter((n) => n.type === "stub-label" && (n.data as StubLabelData).linkedConnectionId === linkedId)
+      .map((n) => n.id);
+    store.alignStubsToPorts({ stubIds });
+    useSchematicStore.setState({ stubLabelContextMenu: null });
+  }, [menu]);
+
   if (!menu) return null;
 
   const store = useSchematicStore.getState();
@@ -103,6 +119,7 @@ export default function StubLabelContextMenu() {
       <MenuItem label={showRoomLabel} onClick={() => cycleBool("showRoom")} />
       <MenuItem label={pageModeLabel} onClick={cyclePageMode} />
       <div className="border-t border-gray-200 my-1" />
+      <MenuItem label="Align Stubs to Ports" onClick={alignLinkedStubs} />
       <MenuItem label="Show Full Connection" onClick={collapseStubs} />
     </div>
   );

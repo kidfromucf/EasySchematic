@@ -1,6 +1,7 @@
 import { useState, useMemo } from "react";
 import { useSchematicStore } from "../store";
 import type { SchematicNode, ConnectionEdge } from "../types";
+import type { AlignOperation } from "../alignUtils";
 import BulkConnectionEditPanel from "./BulkConnectionEditPanel";
 
 type EntityKind = "device" | "room" | "stub-label" | "note" | "annotation" | "waypoint" | "edge";
@@ -16,6 +17,38 @@ const KIND_LABELS: Record<EntityKind, { singular: string; plural: string }> = {
 };
 
 const KIND_ORDER: EntityKind[] = ["device", "room", "edge", "waypoint", "stub-label", "note", "annotation"];
+
+const ALIGN_TOOLS: { op: AlignOperation; title: string }[] = [
+  { op: "left", title: "Align selected devices left" },
+  { op: "center-h", title: "Align selected devices center" },
+  { op: "right", title: "Align selected devices right" },
+  { op: "top", title: "Align selected devices top" },
+  { op: "middle-v", title: "Align selected devices middle" },
+  { op: "bottom", title: "Align selected devices bottom" },
+  { op: "distribute-h", title: "Space selected devices evenly horizontally" },
+  { op: "distribute-v", title: "Space selected devices evenly vertically" },
+];
+
+function ToolIcon({ op }: { op: AlignOperation }) {
+  switch (op) {
+    case "left":
+      return <svg viewBox="0 0 16 16" className="w-4 h-4" fill="currentColor"><rect x="1" y="1" width="2" height="14" /><rect x="5" y="3" width="8" height="4" opacity={0.6} /><rect x="5" y="9" width="5" height="4" opacity={0.6} /></svg>;
+    case "center-h":
+      return <svg viewBox="0 0 16 16" className="w-4 h-4" fill="currentColor"><rect x="7" y="1" width="2" height="14" /><rect x="3" y="3" width="10" height="4" opacity={0.6} /><rect x="4" y="9" width="8" height="4" opacity={0.6} /></svg>;
+    case "right":
+      return <svg viewBox="0 0 16 16" className="w-4 h-4" fill="currentColor"><rect x="13" y="1" width="2" height="14" /><rect x="3" y="3" width="8" height="4" opacity={0.6} /><rect x="6" y="9" width="5" height="4" opacity={0.6} /></svg>;
+    case "top":
+      return <svg viewBox="0 0 16 16" className="w-4 h-4" fill="currentColor"><rect x="1" y="1" width="14" height="2" /><rect x="2" y="5" width="4" height="8" opacity={0.6} /><rect x="8" y="5" width="4" height="5" opacity={0.6} /></svg>;
+    case "middle-v":
+      return <svg viewBox="0 0 16 16" className="w-4 h-4" fill="currentColor"><rect x="1" y="7" width="14" height="2" /><rect x="2" y="2" width="4" height="12" opacity={0.6} /><rect x="8" y="4" width="4" height="8" opacity={0.6} /></svg>;
+    case "bottom":
+      return <svg viewBox="0 0 16 16" className="w-4 h-4" fill="currentColor"><rect x="1" y="13" width="14" height="2" /><rect x="2" y="3" width="4" height="8" opacity={0.6} /><rect x="8" y="6" width="4" height="5" opacity={0.6} /></svg>;
+    case "distribute-h":
+      return <svg viewBox="0 0 16 16" className="w-4 h-4" fill="currentColor"><rect x="1" y="1" width="1.5" height="14" /><rect x="13.5" y="1" width="1.5" height="14" /><rect x="4" y="4" width="3" height="8" opacity={0.6} /><rect x="9" y="4" width="3" height="8" opacity={0.6} /></svg>;
+    case "distribute-v":
+      return <svg viewBox="0 0 16 16" className="w-4 h-4" fill="currentColor"><rect x="1" y="1" width="14" height="1.5" /><rect x="1" y="13.5" width="14" height="1.5" /><rect x="4" y="4" width="8" height="3" opacity={0.6} /><rect x="4" y="9" width="8" height="3" opacity={0.6} /></svg>;
+  }
+}
 
 function classifyNode(n: SchematicNode): EntityKind | null {
   switch (n.type) {
@@ -57,10 +90,12 @@ export default function SelectionFilterBar() {
   }, [selectionKey]);
 
   const edgeCount = counts.edge ?? 0;
+  const deviceCount = counts.device ?? 0;
   const presentKinds = KIND_ORDER.filter((k) => (counts[k] ?? 0) > 0);
   const totalSelected = presentKinds.reduce((sum, k) => sum + (counts[k] ?? 0), 0);
 
   const [panelOpen, setPanelOpen] = useState(false);
+  const alignSelectedDevices = useSchematicStore((s) => s.alignSelectedDevices);
 
   // Show bar whenever 2+ entities are selected, or the edit panel is pinned open
   if (totalSelected < 2 && !panelOpen) return null;
@@ -97,7 +132,7 @@ export default function SelectionFilterBar() {
     <>
       {panelOpen && <BulkConnectionEditPanel onClose={() => setPanelOpen(false)} />}
       <div
-        className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[40] flex items-center gap-1.5 px-2 py-1.5 bg-white border border-[var(--color-border)] rounded-lg shadow-lg"
+        className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[40] flex max-w-[calc(100vw-2rem)] flex-wrap items-center justify-center gap-1.5 px-2 py-1.5 bg-white border border-[var(--color-border)] rounded-lg shadow-lg"
         data-print-hide
         onMouseDown={(e) => e.stopPropagation()}
       >
@@ -122,6 +157,46 @@ export default function SelectionFilterBar() {
               </button>
             );
           })}
+        {deviceCount >= 2 && (
+          <>
+            <div className="w-px h-5 bg-[var(--color-border)] mx-0.5" />
+            <span className="text-[10px] uppercase tracking-wide text-[var(--color-text-muted)] px-0.5">
+              Align
+            </span>
+            <div className="flex items-center gap-0.5">
+              {ALIGN_TOOLS.slice(0, 6).map((tool) => (
+                <button
+                  key={tool.op}
+                  title={tool.title}
+                  className="w-6 h-6 flex items-center justify-center rounded border border-[var(--color-border)] text-[var(--color-text)] bg-white hover:bg-blue-50 hover:text-blue-700 transition-colors cursor-pointer"
+                  onClick={() => alignSelectedDevices(tool.op)}
+                >
+                  <ToolIcon op={tool.op} />
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+        {deviceCount >= 3 && (
+          <>
+            <div className="w-px h-5 bg-[var(--color-border)] mx-0.5" />
+            <span className="text-[10px] uppercase tracking-wide text-[var(--color-text-muted)] px-0.5">
+              Space
+            </span>
+            <div className="flex items-center gap-0.5">
+              {ALIGN_TOOLS.slice(6).map((tool) => (
+                <button
+                  key={tool.op}
+                  title={tool.title}
+                  className="w-6 h-6 flex items-center justify-center rounded border border-[var(--color-border)] text-[var(--color-text)] bg-white hover:bg-blue-50 hover:text-blue-700 transition-colors cursor-pointer"
+                  onClick={() => alignSelectedDevices(tool.op)}
+                >
+                  <ToolIcon op={tool.op} />
+                </button>
+              ))}
+            </div>
+          </>
+        )}
         {(edgeCount >= 2 || panelOpen) && (
           <button
             title="Edit properties of selected connections"

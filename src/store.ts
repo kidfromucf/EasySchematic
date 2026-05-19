@@ -34,7 +34,7 @@ import type {
 } from "./types";
 import type { ReactFlowInstance } from "@xyflow/react";
 import type { SignalType, ScrollConfig, LineStyle, LabelCaseMode, DistanceSettings, PanMode, StubLabelPageMode } from "./types";
-import { defaultStubPlacement } from "./stubPlacement";
+import { defaultStubPlacement, STUB_GAP, STUB_H_EST, STUB_W_EST } from "./stubPlacement";
 import { getPortAbsolutePositions } from "./snapUtils";
 import { DEFAULT_SCROLL_CONFIG, DEFAULT_LABEL_CASE, DEFAULT_DISTANCE_SETTINGS, DEFAULT_PAN_MODE, DEFAULT_STUB_LABEL_SHOW_PORT, DEFAULT_STUB_LABEL_SHOW_ROOM, DEFAULT_STUB_LABEL_PAGE_MODE } from "./types";
 import { pairKey } from "./roomDistance";
@@ -231,6 +231,7 @@ interface SchematicState {
   copySelected: () => void;
   pasteClipboard: () => void;
   alignSelectedNodes: (op: AlignOperation) => void;
+  alignSelectedDevices: (op: AlignOperation) => void;
   isValidConnection: (connection: Connection) => boolean;
   updateDeviceLabel: (nodeId: string, label: string) => void;
   batchUpdateDeviceLabels: (changes: { nodeId: string; label: string }[]) => void;
@@ -331,6 +332,8 @@ interface SchematicState {
   // Stub conversion (real React Flow nodes for the labels)
   convertEdgeToStubs: (edgeId: string) => void;
   collapseStubsForEdge: (edgeId: string) => void;
+  reconnectStubbedEdge: (edgeId: string, connection: Connection) => boolean;
+  alignStubsToPorts: (options?: { deviceIds?: string[]; stubIds?: string[]; skipUndo?: boolean }) => void;
 
   // Manual edge routing
   setManualWaypoints: (edgeId: string, waypoints: { x: number; y: number }[]) => void;
@@ -756,8 +759,14 @@ let pendingUndoSnapshot: Snapshot | null = null;
 
 /** Edge ID being reconnected — excluded from isValidConnection duplicate checks. */
 let _reconnectingEdgeId: string | null = null;
+let _reconnectingEdgeIds: Set<string> | null = null;
 export function setReconnectingEdgeId(id: string | null) {
   _reconnectingEdgeId = id;
+  _reconnectingEdgeIds = null;
+}
+
+function isReconnectIgnored(edgeId: string): boolean {
+  return edgeId === _reconnectingEdgeId || _reconnectingEdgeIds?.has(edgeId) === true;
 }
 
 function pushUndo(partial: { nodes: SchematicNode[]; edges: ConnectionEdge[]; autoRoute?: boolean }) {
@@ -999,6 +1008,24 @@ function removeOrphanedEdges(nodes: SchematicNode[], edges: ConnectionEdge[]): C
     if (tgtNode.type === "device" && !getPortFromHandle(nodes, e.target, e.targetHandle ?? null)) return false;
     return true;
   });
+}
+
+function absolutePosFromMap(
+  node: SchematicNode | undefined,
+  nodeMap: Map<string, SchematicNode>,
+): { x: number; y: number } {
+  if (!node) return { x: 0, y: 0 };
+  let x = node.position.x;
+  let y = node.position.y;
+  let parentId = node.parentId;
+  while (parentId) {
+    const parent = nodeMap.get(parentId);
+    if (!parent) break;
+    x += parent.position.x;
+    y += parent.position.y;
+    parentId = parent.parentId;
+  }
+  return { x, y };
 }
 
 /** Unique key for custom template management (order, groups, deletion). */
@@ -1743,8 +1770,65 @@ export const useSchematicStore = create<SchematicState>((set, get) => ({
     get().saveToLocalStorage();
   },
 
+  alignSelectedDevices: (op) => {
+    const state = get();
+    const selected = state.nodes.filter((n) => n.selected && n.type === "device");
+
+    const nodeMap = new Map(state.nodes.map((n) => [n.id, n]));
+    const parentOffsets = new Map<string, { dx: number; dy: number }>();
+    const absSelected = selected.map((n) => {
+      let dx = 0;
+      let dy = 0;
+      let pid: string | undefined = n.parentId;
+      while (pid) {
+        const parent = nodeMap.get(pid);
+        if (!parent) break;
+        dx += parent.position.x;
+        dy += parent.position.y;
+        pid = parent.parentId;
+      }
+      parentOffsets.set(n.id, { dx, dy });
+      if (dx === 0 && dy === 0) return n;
+      return { ...n, position: { x: n.position.x + dx, y: n.position.y + dy } };
+    });
+
+    const raw = computeAlignment(absSelected, op);
+    if (raw.size === 0) return;
+    const resolved = resolveAlignmentOverlaps(absSelected, raw, op);
+    if (resolved.size === 0) return;
+
+    const updates = new Map<string, { x: number; y: number }>();
+    for (const [id, pos] of resolved) {
+      const off = parentOffsets.get(id)!;
+      updates.set(id, { x: pos.x - off.dx, y: pos.y - off.dy });
+    }
+
+    pushUndo({ nodes: state.nodes, edges: state.edges });
+    set({
+      nodes: state.nodes.map((n) => {
+        const pos = updates.get(n.id);
+        return pos ? { ...n, position: pos } : n;
+      }),
+    });
+    get().saveToLocalStorage();
+  },
+
   isValidConnection: (connection) => {
     const state = get();
+    const reconnectingEdge = _reconnectingEdgeId
+      ? state.edges.find((e) => e.id === _reconnectingEdgeId)
+      : undefined;
+    if (reconnectingEdge?.data?.linkedConnectionId) {
+      const srcNode = connection.source ? state.nodes.find((n) => n.id === connection.source) : undefined;
+      const tgtNode = connection.target ? state.nodes.find((n) => n.id === connection.target) : undefined;
+      const involvesStub = srcNode?.type === "stub-label" || tgtNode?.type === "stub-label";
+      if (involvesStub) {
+        const deviceId = srcNode?.type === "device" ? connection.source : tgtNode?.type === "device" ? connection.target : undefined;
+        const handleId = srcNode?.type === "device" ? connection.sourceHandle : tgtNode?.type === "device" ? connection.targetHandle : undefined;
+        return !!deviceId && !!getPortFromHandle(state.nodes, deviceId, handleId ?? null);
+      }
+    }
+
     const sourcePort = getPortFromHandle(
       state.nodes,
       connection.source,
@@ -1807,13 +1891,13 @@ export const useSchematicStore = create<SchematicState>((set, get) => ({
       // Duplicate-handle guard (same as non-passthrough below)
       if (!sourcePort.multiConnect) {
         const dup = state.edges.some(
-          (e) => e.id !== _reconnectingEdgeId && e.source === connection.source && e.sourceHandle === connection.sourceHandle,
+          (e) => !isReconnectIgnored(e.id) && e.source === connection.source && e.sourceHandle === connection.sourceHandle,
         );
         if (dup) return false;
       }
       if (!targetPort.multiConnect) {
         const dup = state.edges.some(
-          (e) => e.id !== _reconnectingEdgeId && e.target === connection.target && e.targetHandle === connection.targetHandle,
+          (e) => !isReconnectIgnored(e.id) && e.target === connection.target && e.targetHandle === connection.targetHandle,
         );
         if (dup) return false;
       }
@@ -1848,7 +1932,7 @@ export const useSchematicStore = create<SchematicState>((set, get) => ({
     if (!targetPort.multiConnect) {
       const duplicateTarget = state.edges.some(
         (e) =>
-          e.id !== _reconnectingEdgeId &&
+          !isReconnectIgnored(e.id) &&
           e.target === connection.target &&
           e.targetHandle === connection.targetHandle,
       );
@@ -1858,7 +1942,7 @@ export const useSchematicStore = create<SchematicState>((set, get) => ({
     if (!sourcePort.multiConnect) {
       const duplicateSource = state.edges.some(
         (e) =>
-          e.id !== _reconnectingEdgeId &&
+          !isReconnectIgnored(e.id) &&
           e.source === connection.source &&
           e.sourceHandle === connection.sourceHandle,
       );
@@ -1873,8 +1957,11 @@ export const useSchematicStore = create<SchematicState>((set, get) => ({
         : `${baseId}-out`;
       const otherConnected = state.edges.some(
         (e) =>
-          (e.source === connection.source && e.sourceHandle === otherHandle) ||
-          (e.target === connection.source && e.targetHandle === otherHandle),
+          !isReconnectIgnored(e.id) &&
+          (
+            (e.source === connection.source && e.sourceHandle === otherHandle) ||
+            (e.target === connection.source && e.targetHandle === otherHandle)
+          ),
       );
       if (otherConnected) return false;
     }
@@ -1885,8 +1972,11 @@ export const useSchematicStore = create<SchematicState>((set, get) => ({
         : `${baseId}-in`;
       const otherConnected = state.edges.some(
         (e) =>
-          (e.source === connection.target && e.sourceHandle === otherHandle) ||
-          (e.target === connection.target && e.targetHandle === otherHandle),
+          !isReconnectIgnored(e.id) &&
+          (
+            (e.source === connection.target && e.sourceHandle === otherHandle) ||
+            (e.target === connection.target && e.targetHandle === otherHandle)
+          ),
       );
       if (otherConnected) return false;
     }
@@ -4781,6 +4871,209 @@ export const useSchematicStore = create<SchematicState>((set, get) => ({
         }
         return { ...n, data: merged };
       }),
+    });
+    get().saveToLocalStorage();
+  },
+
+  reconnectStubbedEdge: (edgeId, connection) => {
+    const state = get();
+    const edge = state.edges.find((e) => e.id === edgeId);
+    if (!edge?.data?.linkedConnectionId) return false;
+
+    const nodeMap = new Map(state.nodes.map((n) => [n.id, n] as const));
+    const sourceNode = nodeMap.get(edge.source);
+    const targetNode = nodeMap.get(edge.target);
+    const sourceIsStub = sourceNode?.type === "stub-label";
+    const targetIsStub = targetNode?.type === "stub-label";
+    if (sourceIsStub === targetIsStub) return false;
+
+    const deviceRole: "source" | "target" = targetIsStub ? "source" : "target";
+    const linkedEdges = state.edges.filter((e) => e.data?.linkedConnectionId === edge.data?.linkedConnectionId);
+    const partner = linkedEdges.find((e) => e.id !== edge.id);
+    if (!partner) return false;
+
+    const connSourceNode = connection.source ? nodeMap.get(connection.source) : undefined;
+    const connTargetNode = connection.target ? nodeMap.get(connection.target) : undefined;
+
+    let nextDeviceId: string | undefined;
+    let nextHandle: string | null | undefined;
+    if (deviceRole === "source") {
+      if (connection.source !== edge.source && connSourceNode?.type === "device") {
+        nextDeviceId = connection.source;
+        nextHandle = connection.sourceHandle;
+      } else if (connection.target !== edge.target && connTargetNode?.type === "device") {
+        nextDeviceId = connection.target;
+        nextHandle = connection.targetHandle;
+      } else if (connSourceNode?.type === "device") {
+        nextDeviceId = connection.source;
+        nextHandle = connection.sourceHandle;
+      } else if (connTargetNode?.type === "device") {
+        nextDeviceId = connection.target;
+        nextHandle = connection.targetHandle;
+      }
+    } else {
+      if (connection.target !== edge.target && connTargetNode?.type === "device") {
+        nextDeviceId = connection.target;
+        nextHandle = connection.targetHandle;
+      } else if (connection.source !== edge.source && connSourceNode?.type === "device") {
+        nextDeviceId = connection.source;
+        nextHandle = connection.sourceHandle;
+      } else if (connTargetNode?.type === "device") {
+        nextDeviceId = connection.target;
+        nextHandle = connection.targetHandle;
+      } else if (connSourceNode?.type === "device") {
+        nextDeviceId = connection.source;
+        nextHandle = connection.sourceHandle;
+      }
+    }
+
+    if (!nextDeviceId || !nextHandle) return false;
+
+    const logicalConnection: Connection = deviceRole === "source"
+      ? {
+          source: nextDeviceId,
+          sourceHandle: nextHandle,
+          target: partner.target,
+          targetHandle: partner.targetHandle ?? null,
+        }
+      : {
+          source: partner.source,
+          sourceHandle: partner.sourceHandle ?? null,
+          target: nextDeviceId,
+          targetHandle: nextHandle,
+        };
+
+    const prevIgnored = _reconnectingEdgeIds;
+    _reconnectingEdgeIds = new Set(linkedEdges.map((e) => e.id));
+    const valid = get().isValidConnection(logicalConnection);
+    _reconnectingEdgeIds = prevIgnored;
+    if (!valid) {
+      get().addToast("That port is not compatible with this stubbed connection", "error");
+      return false;
+    }
+
+    const nextPort = getPortFromHandle(state.nodes, nextDeviceId, nextHandle);
+    const nextEdge: ConnectionEdge = deviceRole === "source"
+      ? {
+          ...edge,
+          source: nextDeviceId,
+          sourceHandle: nextHandle,
+          data: {
+            ...edge.data,
+            ...(nextPort ? { signalType: nextPort.signalType } : {}),
+          },
+          style: {
+            ...edge.style,
+            ...(nextPort ? { stroke: resolveEdgeStroke({ ...edge.data, signalType: nextPort.signalType }) } : {}),
+          },
+        }
+      : {
+          ...edge,
+          target: nextDeviceId,
+          targetHandle: nextHandle,
+          data: {
+            ...edge.data,
+            ...(nextPort ? { signalType: nextPort.signalType } : {}),
+          },
+          style: {
+            ...edge.style,
+            ...(nextPort ? { stroke: resolveEdgeStroke({ ...edge.data, signalType: nextPort.signalType }) } : {}),
+          },
+        };
+
+    set({
+      edges: state.edges.map((e) => (e.id === edge.id ? nextEdge : e)),
+    });
+    get().alignStubsToPorts({
+      stubIds: state.nodes
+        .filter((n) => n.type === "stub-label" && (n.data as import("./types").StubLabelData).linkedConnectionId === edge.data?.linkedConnectionId)
+        .map((n) => n.id),
+      skipUndo: true,
+    });
+    get().saveToLocalStorage();
+    return true;
+  },
+
+  alignStubsToPorts: (options) => {
+    const state = get();
+    const deviceFilter = options?.deviceIds ? new Set(options.deviceIds) : null;
+    const stubFilter = options?.stubIds ? new Set(options.stubIds) : null;
+    const nodeMap = new Map(state.nodes.map((n) => [n.id, n] as const));
+    const displayDefaults = {
+      useShortNames: state.useShortNames,
+      wrapDeviceLabels: state.wrapDeviceLabels,
+    };
+
+    const nodeUpdates = new Map<string, { x: number; y: number; data: import("./types").StubLabelData }>();
+    const edgeHandleUpdates = new Map<string, Partial<ConnectionEdge>>();
+
+    for (const stub of state.nodes) {
+      if (stub.type !== "stub-label") continue;
+      if (stubFilter && !stubFilter.has(stub.id)) continue;
+      const data = stub.data as import("./types").StubLabelData;
+      const ownEdge = state.edges.find((e) =>
+        data.side === "source" ? e.target === stub.id : e.source === stub.id,
+      );
+      if (!ownEdge) continue;
+
+      const deviceId = data.side === "source" ? ownEdge.source : ownEdge.target;
+      if (deviceFilter && !deviceFilter.has(deviceId)) continue;
+      const deviceHandleId = data.side === "source" ? ownEdge.sourceHandle : ownEdge.targetHandle;
+      const device = nodeMap.get(deviceId);
+      if (!device || device.type !== "device") continue;
+
+      const portPos = getPortAbsolutePositions(device, nodeMap, displayDefaults)
+        .find((p) => p.handleId === deviceHandleId);
+      if (!portPos) continue;
+
+      const stubW = (stub.measured?.width as number | undefined) ?? (stub.width as number | undefined) ?? STUB_W_EST;
+      const stubH = (stub.measured?.height as number | undefined) ?? (stub.height as number | undefined) ?? STUB_H_EST;
+      const desiredAbsX = portPos.side === "right"
+        ? portPos.absX + STUB_GAP
+        : portPos.absX - STUB_GAP - stubW;
+      const desiredAbsY = portPos.absY - stubH / 2;
+
+      const parentAbs = stub.parentId ? absolutePosFromMap(nodeMap.get(stub.parentId), nodeMap) : { x: 0, y: 0 };
+      const nextPos = {
+        x: desiredAbsX - parentAbs.x,
+        y: desiredAbsY - parentAbs.y,
+      };
+
+      const nextHandle: "l" | "r" = portPos.side === "right" ? "l" : "r";
+      const currentHandle = data.side === "source" ? ownEdge.targetHandle : ownEdge.sourceHandle;
+      if (currentHandle !== nextHandle) {
+        edgeHandleUpdates.set(
+          ownEdge.id,
+          data.side === "source" ? { targetHandle: nextHandle } : { sourceHandle: nextHandle },
+        );
+      }
+
+      const nextData = data.placed ? data : { ...data, placed: true };
+      if (
+        Math.abs(stub.position.x - nextPos.x) > 0.5 ||
+        Math.abs(stub.position.y - nextPos.y) > 0.5 ||
+        nextData !== data
+      ) {
+        nodeUpdates.set(stub.id, { ...nextPos, data: nextData });
+      }
+    }
+
+    if (nodeUpdates.size === 0 && edgeHandleUpdates.size === 0) return;
+    if (!options?.skipUndo) pushUndo({ nodes: state.nodes, edges: state.edges });
+
+    set({
+      nodes: state.nodes.map((n) => {
+        const update = nodeUpdates.get(n.id);
+        return update && n.type === "stub-label"
+          ? { ...n, position: { x: update.x, y: update.y }, data: update.data }
+          : n;
+      }),
+      edges: edgeHandleUpdates.size > 0
+        ? state.edges.map((e) => {
+            const update = edgeHandleUpdates.get(e.id);
+            return update ? { ...e, ...update } : e;
+          })
+        : state.edges,
     });
     get().saveToLocalStorage();
   },
