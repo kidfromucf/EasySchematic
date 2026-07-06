@@ -704,7 +704,6 @@ export class DxfWriter {
     this.i(97, 0); // source boundary objects count
     this.i(75, 0); // hatch style: odd parity
     this.i(76, 1); // hatch pattern type: predefined
-    this.r(47, 1); // pixel size
     this.i(98, 0); // seed points
   }
 
@@ -737,7 +736,6 @@ export class DxfWriter {
     this.i(97, 0);
     this.i(75, 0);
     this.i(76, 1);
-    this.r(47, 1);
     this.i(98, 0);
   }
 

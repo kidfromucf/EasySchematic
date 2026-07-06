@@ -51,6 +51,17 @@ html, body, #root {
   overscroll-behavior: none;
 }
 
+.react-flow__viewport,
+.react-flow__nodes,
+.react-flow__edges,
+.react-flow__edgelabel-renderer {
+  will-change: transform;
+}
+
+.react-flow__node {
+  contain: layout style;
+}
+
 /* Pan-first mode cursor feedback */
 .pan-mode .react-flow__pane { cursor: grab; }
 .pan-mode .react-flow__pane:active { cursor: grabbing; }

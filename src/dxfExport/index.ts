@@ -20,6 +20,7 @@ import {
   resolveLineStyle,
 } from "./geometry";
 import { emitAnnotation, emitDevice, emitRoom } from "./nodes";
+import { emitStubLabel } from "./stubs";
 import { emitTitleBlock } from "./titleBlock";
 import { emitLegend } from "./legend";
 
@@ -114,12 +115,40 @@ export function exportDxf(rfInstance: ReactFlowInstance) {
     emitEdgeGeometry(writer, routed, layer, entityStyle, allArcCrossings);
 
     // Labels (cable ID + custom)
+    const sourceIsStub = nodes.find((n) => n.id === edge.source)?.type === "stub-label";
+    const targetIsStub = nodes.find((n) => n.id === edge.target)?.type === "stub-label";
     emitCableIdLabels(
       writer, edge, routed,
       state.cableIdLabelMode, state.cableIdGap, state.cableIdMidOffset,
       trueColor,
+      {
+        suppressSourceEndpoint: sourceIsStub,
+        suppressTargetEndpoint: targetIsStub,
+      },
     );
     emitCustomLabel(writer, edge, routed, trueColor);
+  }
+
+  // Stub labels render as node badges above connection lines on the canvas.
+  // Emit them after edges so their white fill covers line endpoints the same way.
+  for (const node of nodes) {
+    if (node.type === "stub-label") {
+      emitStubLabel(writer, node, rfInstance, nodes, edges, {
+        signalColors: state.signalColors,
+        stubLabelShowPort: state.stubLabelShowPort,
+        stubLabelShowRoom: state.stubLabelShowRoom,
+        stubLabelPageMode: state.stubLabelPageMode,
+        printView: state.printView,
+        printPaperId: state.printPaperId,
+        printCustomWidthIn: state.printCustomWidthIn,
+        printCustomHeightIn: state.printCustomHeightIn,
+        printOrientation: state.printOrientation,
+        printScale: state.printScale,
+        titleBlockLayoutHeightIn: state.titleBlockLayout?.heightIn ?? 1,
+        printOriginOffsetX: state.printOriginOffsetX,
+        printOriginOffsetY: state.printOriginOffsetY,
+      });
+    }
   }
 
   // ─── Title block (if configured) ───────────────────────────────────
@@ -160,4 +189,3 @@ export function exportDxf(rfInstance: ReactFlowInstance) {
   link.click();
   URL.revokeObjectURL(url);
 }
-

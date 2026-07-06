@@ -342,6 +342,7 @@ export function emitCableIdLabels(
   globalGap: number,
   globalMidOffset: number,
   trueColor: number,
+  opts: { suppressSourceEndpoint?: boolean; suppressTargetEndpoint?: boolean } = {},
 ) {
   if (!edge.data?.cableId) return;
   if (edge.data?.hideCableId) return;
@@ -370,6 +371,8 @@ export function emitCableIdLabels(
   } else {
     // Emit at both ends
     for (const nearStart of [true, false]) {
+      if (nearStart && opts.suppressSourceEndpoint) continue;
+      if (!nearStart && opts.suppressTargetEndpoint) continue;
       const pos = findEndpointLabelPos(routed, nearStart, gap);
       writer.addMText(
         CANONICAL_LAYERS.LABELS,

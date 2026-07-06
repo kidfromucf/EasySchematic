@@ -57,11 +57,15 @@ import { DEVICE_TEMPLATES } from "./deviceLibrary";
 import { loadSharedSchematic, checkSession } from "./templateApi";
 import { refreshCloudCache } from "./cloudSync";
 import { useTheme } from "./hooks/useTheme";
+import { reconcileWaypointNodes } from "./waypointSync";
 
 /** Darkens the canvas area left of x=0 and above y=0, marking the printable origin. */
 function CanvasOriginOverlay() {
-  const { x: vx, y: vy, zoom } = useViewport();
-  const FAR = 1e6;
+  const { x: vx, y: vy } = useViewport();
+  const leftWidth = Math.max(0, vx);
+  const topHeight = Math.max(0, vy);
+  const topLeft = Math.max(0, vx);
+
   return (
     <div
       style={{
@@ -72,20 +76,58 @@ function CanvasOriginOverlay() {
         overflow: "hidden",
       }}
     >
-      <svg
+      <div
         style={{
           position: "absolute",
-          overflow: "visible",
-          width: 1,
-          height: 1,
-          transform: `translate(${vx}px, ${vy}px) scale(${zoom})`,
-          transformOrigin: "0 0",
+          left: 0,
+          top: 0,
+          bottom: 0,
+          width: leftWidth,
+          background: "var(--color-canvas-origin)",
         }}
-      >
-        {/* Everything left of x=0 */}
-        <rect x={-FAR} y={-FAR} width={FAR} height={2 * FAR} fill="var(--color-canvas-origin)" />
-        {/* Everything above y=0 (only the positive-x portion, avoid double-fill) */}
-        <rect x={0} y={-FAR} width={FAR} height={FAR} fill="var(--color-canvas-origin)" />
+      />
+      <div
+        style={{
+          position: "absolute",
+          left: topLeft,
+          top: 0,
+          right: 0,
+          height: topHeight,
+          background: "var(--color-canvas-origin)",
+        }}
+      />
+    </div>
+  );
+}
+
+function ConnectPreviewOverlay({
+  preview,
+}: {
+  preview: {
+    fromX: number; fromY: number; toX: number; toY: number; fromSource: boolean;
+    snapped: boolean; valid: boolean; adaptable: boolean;
+  };
+}) {
+  const { x: vx, y: vy, zoom } = useViewport();
+  const { fromX, fromY, toX, toY, fromSource, snapped, valid, adaptable } = preview;
+  const dx = Math.abs(toX - fromX);
+  const ctrl = Math.max(dx * 0.5, 50);
+  const c1x = fromSource ? fromX + ctrl : fromX - ctrl;
+  const c2x = fromSource ? toX - ctrl : toX + ctrl;
+  const d = `M ${fromX} ${fromY} C ${c1x} ${fromY}, ${c2x} ${toY}, ${toX} ${toY}`;
+  const color = snapped ? (valid ? "#22c55e" : adaptable ? "#eab308" : "#ef4444") : "#b1b1b7";
+
+  return (
+    <div style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 1000 }}>
+      <svg style={{
+        position: "absolute", overflow: "visible", width: 1, height: 1,
+        transform: `translate(${vx}px, ${vy}px) scale(${zoom})`,
+        transformOrigin: "0 0",
+      }}>
+        <path d={d} stroke={color} strokeWidth={2 / zoom} fill="none" />
+        {snapped && (
+          <circle cx={toX} cy={toY} r={4 / zoom} fill={color} opacity={0.6} />
+        )}
       </svg>
     </div>
   );
@@ -112,6 +154,33 @@ function ResizeSnapGuides({ dragGuides }: { dragGuides: GuideLine[] }) {
     : [];
   return <SnapGuides guides={combined} />;
 }
+
+function getNodeAbsolutePosition(node: SchematicNode, nodeMap: Map<string, SchematicNode>): { x: number; y: number } {
+  let x = node.position.x;
+  let y = node.position.y;
+  let parentId = node.parentId as string | undefined;
+  while (parentId) {
+    const parent = nodeMap.get(parentId);
+    if (!parent) break;
+    x += parent.position.x;
+    y += parent.position.y;
+    parentId = parent.parentId as string | undefined;
+  }
+  return { x, y };
+}
+
+function getNodeBounds(node: SchematicNode, nodeMap: Map<string, SchematicNode>) {
+  const pos = getNodeAbsolutePosition(node, nodeMap);
+  const isRoom = node.type === "room";
+  const width = node.measured?.width ?? (node.style?.width as number | undefined) ?? (node.width as number | undefined) ?? (isRoom ? 400 : 180);
+  const height = node.measured?.height ?? (node.style?.height as number | undefined) ?? (node.height as number | undefined) ?? (isRoom ? 300 : 60);
+  return { ...pos, width, height, area: width * height };
+}
+
+type RoomWaypointDragState = {
+  rooms: Map<string, { x: number; y: number; width: number; height: number; area: number }>;
+  waypoints: Array<{ edgeId: string; index: number; roomId: string; x: number; y: number }>;
+};
 
 function AutoRouteChip() {
   const autoRoute = useSchematicStore((s) => s.autoRoute);
@@ -466,6 +535,8 @@ function SchematicCanvas() {
   // subsequent wheel events as trackpad until 400ms of silence (gesture end).
   const trackpadActiveRef = useRef(false);
   const trackpadTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const pendingViewportRef = useRef<{ x: number; y: number; zoom: number } | null>(null);
+  const viewportRafRef = useRef<number | null>(null);
 
   // Edge reconnection state (React Flow's reconnection path)
   const reconnectingRef = useRef(false);
@@ -488,11 +559,9 @@ function SchematicCanvas() {
   const deviceCreatorPosRef = useRef<{ x: number; y: number } | undefined>(undefined);
   const lastPaneClickRef = useRef<{ time: number; x: number; y: number }>({ time: 0, x: 0, y: 0 });
 
-  // Viewport transform for rendering flow-space overlays
-  const { x: vx, y: vy, zoom } = useViewport();
-
   // Snap guide lines shown during drag
   const [snapGuides, setSnapGuides] = useState<GuideLine[]>([]);
+  const roomWaypointDragRef = useRef<RoomWaypointDragState | null>(null);
 
   // Load saved state on mount
   useEffect(() => {
@@ -659,6 +728,16 @@ function SchematicCanvas() {
     // Find the React Flow viewport element
     const el = document.querySelector(".react-flow") as HTMLElement | null;
     if (!el) return;
+    const queueViewport = (next: { x: number; y: number; zoom: number }) => {
+      pendingViewportRef.current = next;
+      if (viewportRafRef.current !== null) return;
+      viewportRafRef.current = requestAnimationFrame(() => {
+        viewportRafRef.current = null;
+        const viewport = pendingViewportRef.current;
+        pendingViewportRef.current = null;
+        if (viewport) rfInstance.setViewport(viewport);
+      });
+    };
     const handler = (e: WheelEvent) => {
       // Don't interfere with scrolling inside overlays (dialogs, panels, etc.)
       const target = e.target as HTMLElement;
@@ -680,7 +759,7 @@ function SchematicCanvas() {
       }
 
       let vp: { x: number; y: number; zoom: number };
-      try { vp = rfInstance.getViewport(); } catch { return; }
+      try { vp = pendingViewportRef.current ?? rfInstance.getViewport(); } catch { return; }
 
       // Trackpad pinch-to-zoom: browser synthesizes ctrlKey on pinch gestures.
       // If ctrlKey is set but the physical key isn't held, it's a pinch — always zoom.
@@ -691,7 +770,7 @@ function SchematicCanvas() {
         const sx = e.clientX - rect.left;
         const sy = e.clientY - rect.top;
         const ratio = newZoom / vp.zoom;
-        rfInstance.setViewport({
+        queueViewport({
           x: sx - (sx - vp.x) * ratio,
           y: sy - (sy - vp.y) * ratio,
           zoom: newZoom,
@@ -702,7 +781,7 @@ function SchematicCanvas() {
       // Trackpad scroll: once trackpad mode is detected, pan both axes for all
       // unmodified events (including pure-vertical scrolls that lack deltaX).
       if (!e.ctrlKey && !e.shiftKey && trackpadActiveRef.current) {
-        rfInstance.setViewport({
+        queueViewport({
           x: vp.x - e.deltaX * cfg.panSpeed,
           y: vp.y - e.deltaY * cfg.panSpeed,
           zoom: vp.zoom,
@@ -721,21 +800,26 @@ function SchematicCanvas() {
         const sx = e.clientX - rect.left;
         const sy = e.clientY - rect.top;
         const ratio = newZoom / vp.zoom;
-        rfInstance.setViewport({
+        queueViewport({
           x: sx - (sx - vp.x) * ratio,
           y: sy - (sy - vp.y) * ratio,
           zoom: newZoom,
         });
       } else if (action === "pan-x") {
-        rfInstance.setViewport({ x: vp.x - delta * cfg.panSpeed, y: vp.y, zoom: vp.zoom });
+        queueViewport({ x: vp.x - delta * cfg.panSpeed, y: vp.y, zoom: vp.zoom });
       } else {
-        rfInstance.setViewport({ x: vp.x, y: vp.y - delta * cfg.panSpeed, zoom: vp.zoom });
+        queueViewport({ x: vp.x, y: vp.y - delta * cfg.panSpeed, zoom: vp.zoom });
       }
     };
     el.addEventListener("wheel", handler, { passive: false, capture: true });
     return () => {
       el.removeEventListener("wheel", handler, { capture: true });
       clearTimeout(trackpadTimerRef.current);
+      if (viewportRafRef.current !== null) {
+        cancelAnimationFrame(viewportRafRef.current);
+        viewportRafRef.current = null;
+      }
+      pendingViewportRef.current = null;
     };
   }, [rfInstance]);
 
@@ -1156,10 +1240,107 @@ function SchematicCanvas() {
     [clearClickConnect, rfStore, screenToFlowPosition],
   );
 
-  const onNodeDragStart = useCallback(() => {
-    setPendingUndoSnapshot();
-    useSchematicStore.setState({ isDragging: true });
-  }, [setPendingUndoSnapshot]);
+  const captureRoomWaypointDrag = useCallback((draggedNode: Node, draggedNodes: Node[]) => {
+    const state = useSchematicStore.getState();
+    const dragged = draggedNodes?.length ? draggedNodes : [draggedNode];
+    const draggedIds = new Set(dragged.map((n) => n.id));
+    const nodeMap = new Map(state.nodes.map((n) => [n.id, n]));
+    const rooms = new Map<string, { x: number; y: number; width: number; height: number; area: number }>();
+
+    for (const node of state.nodes) {
+      if (node.type !== "room" || !draggedIds.has(node.id)) continue;
+      rooms.set(node.id, getNodeBounds(node, nodeMap));
+    }
+
+    if (rooms.size === 0) {
+      roomWaypointDragRef.current = null;
+      return;
+    }
+
+    const waypoints: RoomWaypointDragState["waypoints"] = [];
+    for (const node of state.nodes) {
+      if (node.type !== "waypoint") continue;
+      const pos = getNodeAbsolutePosition(node, nodeMap);
+      let bestRoomId: string | null = null;
+      let bestArea = Infinity;
+      for (const [roomId, room] of rooms) {
+        if (
+          pos.x >= room.x && pos.x <= room.x + room.width &&
+          pos.y >= room.y && pos.y <= room.y + room.height &&
+          room.area < bestArea
+        ) {
+          bestRoomId = roomId;
+          bestArea = room.area;
+        }
+      }
+      if (!bestRoomId) continue;
+      const data = node.data as { edgeId: string; index: number };
+      waypoints.push({ edgeId: data.edgeId, index: data.index, roomId: bestRoomId, x: pos.x, y: pos.y });
+    }
+
+    roomWaypointDragRef.current = waypoints.length > 0 ? { rooms, waypoints } : null;
+  }, []);
+
+  const applyRoomWaypointDrag = useCallback(() => {
+    const captured = roomWaypointDragRef.current;
+    roomWaypointDragRef.current = null;
+    if (!captured) return;
+
+    const state = useSchematicStore.getState();
+    const nodeMap = new Map(state.nodes.map((n) => [n.id, n]));
+    const nextByEdge = new Map<string, Map<number, { x: number; y: number }>>();
+
+    for (const wp of captured.waypoints) {
+      const startRoom = captured.rooms.get(wp.roomId);
+      const currentRoom = nodeMap.get(wp.roomId);
+      if (!startRoom || !currentRoom) continue;
+      const currentRoomPos = getNodeAbsolutePosition(currentRoom, nodeMap);
+      const dx = currentRoomPos.x - startRoom.x;
+      const dy = currentRoomPos.y - startRoom.y;
+      if (dx === 0 && dy === 0) continue;
+      const edgePoints = nextByEdge.get(wp.edgeId) ?? new Map<number, { x: number; y: number }>();
+      edgePoints.set(wp.index, { x: wp.x + dx, y: wp.y + dy });
+      nextByEdge.set(wp.edgeId, edgePoints);
+    }
+
+    if (nextByEdge.size === 0) return;
+
+    let changed = false;
+    const updatedEdges = state.edges.map((edge) => {
+      const points = nextByEdge.get(edge.id);
+      const manualWaypoints = edge.data?.manualWaypoints;
+      if (!points || !manualWaypoints?.length) return edge;
+      let edgeChanged = false;
+      const nextWaypoints = manualWaypoints.map((point, index) => {
+        const next = points.get(index);
+        if (!next || (next.x === point.x && next.y === point.y)) return point;
+        edgeChanged = true;
+        return next;
+      });
+      if (!edgeChanged) return edge;
+      changed = true;
+      return {
+        ...edge,
+        data: { ...edge.data!, manualWaypoints: nextWaypoints, autoRouteWaypoints: undefined },
+      };
+    });
+
+    if (!changed) return;
+    useSchematicStore.setState({
+      edges: updatedEdges,
+      nodes: reconcileWaypointNodes(state.nodes, updatedEdges),
+    });
+    useSchematicStore.getState().saveToLocalStorage();
+  }, []);
+
+  const onNodeDragStart = useCallback(
+    (_event: React.MouseEvent, draggedNode: Node, draggedNodes: Node[]) => {
+      setPendingUndoSnapshot();
+      useSchematicStore.setState({ isDragging: true });
+      captureRoomWaypointDrag(draggedNode, draggedNodes);
+    },
+    [captureRoomWaypointDrag, setPendingUndoSnapshot],
+  );
 
   const onNodeDrag = useCallback(
     (_event: React.MouseEvent, draggedNode: Node, draggedNodes: Node[]) => {
@@ -1314,6 +1495,7 @@ function SchematicCanvas() {
             skipUndo: true,
           });
         }
+        if (anyRoomMoved) applyRoomWaypointDrag();
         flushPendingSnapshot();
         return;
       }
@@ -1387,9 +1569,10 @@ function SchematicCanvas() {
           skipUndo: true,
         });
       }
+      if (draggedNode.type === "room") applyRoomWaypointDrag();
       flushPendingSnapshot();
     },
-    [reparentNode, reparentAllDevices, flushPendingSnapshot],
+    [applyRoomWaypointDrag, reparentNode, reparentAllDevices, flushPendingSnapshot],
   );
 
   // Dynamic minZoom: allow zooming out just enough to see all nodes, with padding
@@ -1528,6 +1711,7 @@ function SchematicCanvas() {
       panOnDrag={isMobile ? [0] : (panMode === "pan-first" ? (shiftHeld ? [1] : [0, 1]) : (spaceHeld ? [0, 1] : [1]))}
       fitView
       minZoom={minZoom}
+      onlyRenderVisibleElements
       elevateNodesOnSelect={false}
       elevateEdgesOnSelect={false}
       deleteKeyCode={null}
@@ -1564,29 +1748,7 @@ function SchematicCanvas() {
     >
       <ResizeSnapGuides dragGuides={snapGuides} />
       {printView && <PageBoundaryOverlay />}
-      {connectPreview && (() => {
-        const { fromX, fromY, toX, toY, fromSource, snapped, valid, adaptable } = connectPreview;
-        const dx = Math.abs(toX - fromX);
-        const ctrl = Math.max(dx * 0.5, 50);
-        const c1x = fromSource ? fromX + ctrl : fromX - ctrl;
-        const c2x = fromSource ? toX - ctrl : toX + ctrl;
-        const d = `M ${fromX} ${fromY} C ${c1x} ${fromY}, ${c2x} ${toY}, ${toX} ${toY}`;
-        const color = snapped ? (valid ? "#22c55e" : adaptable ? "#eab308" : "#ef4444") : "#b1b1b7";
-        return (
-          <div style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 1000 }}>
-            <svg style={{
-              position: "absolute", overflow: "visible", width: 1, height: 1,
-              transform: `translate(${vx}px, ${vy}px) scale(${zoom})`,
-              transformOrigin: "0 0",
-            }}>
-              <path d={d} stroke={color} strokeWidth={2 / zoom} fill="none" />
-              {snapped && (
-                <circle cx={toX} cy={toY} r={4 / zoom} fill={color} opacity={0.6} />
-              )}
-            </svg>
-          </div>
-        );
-      })()}
+      {connectPreview && <ConnectPreviewOverlay preview={connectPreview} />}
       {debugEdges && (
         <div className="absolute top-2 left-1/2 -translate-x-1/2 z-50 flex gap-2">
           <button
