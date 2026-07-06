@@ -17,7 +17,16 @@ import { resolveDeviceLabel } from "../displayName";
 
 type ColumnItem =
   | { type: "port"; port: Port }
-  | { type: "section"; name: string };
+  | { type: "section"; name: string }
+  | { type: "divider" };
+
+/** Hover-tooltip suffix surfacing a USB-C port's Power Delivery rating, if set. */
+function usbcPowerSuffix(port: Port): string {
+  const parts: string[] = [];
+  if (port.usbcPowerSourceW != null) parts.push(`delivers ${port.usbcPowerSourceW}W`);
+  if (port.usbcPowerDrawW != null) parts.push(`draws ${port.usbcPowerDrawW}W`);
+  return parts.length ? ` — USB-C PD: ${parts.join(", ")}` : "";
+}
 
 /** Build a list of ports interleaved with section headers where section changes. */
 function buildColumnItems(ports: Port[]): ColumnItem[] {
@@ -26,6 +35,12 @@ function buildColumnItems(ports: Port[]): ColumnItem[] {
   for (const port of ports) {
     if (port.section && port.section !== lastSection) {
       items.push({ type: "section", name: port.section });
+    } else if (!port.section && lastSection) {
+      // A section just ended into unsectioned ports — emit a closing divider so
+      // the following ports don't read as part of the section. (A section
+      // followed by ANOTHER section needs nothing; that section's own header is
+      // the boundary.)
+      items.push({ type: "divider" });
     }
     items.push({ type: "port", port });
     lastSection = port.section;
@@ -244,6 +259,13 @@ function DeviceNodeComponent({ id, data, selected }: NodeProps<DeviceNodeType>) 
     [passthroughPorts],
   );
 
+  /** A thin closing line marking the end of a section that runs into unsectioned ports. */
+  const renderDivider = (key: string) => (
+    <div key={key} className="h-1.5 flex items-center px-2" aria-hidden>
+      <div className="border-b border-[var(--color-border)]/30 w-full" />
+    </div>
+  );
+
   /** Render a port row for a column (left or right). */
   const renderColumnPort = (port: Port, side: "left" | "right") => {
     const h = handleProps(port, side);
@@ -251,7 +273,7 @@ function DeviceNodeComponent({ id, data, selected }: NodeProps<DeviceNodeType>) 
     return (
       <div
         key={port.id}
-        className={`flex items-center gap-1 ${isLeft ? "pl-3" : "pr-3 justify-end"} h-5 relative`}
+        className={`flex items-center gap-1 ${isLeft ? "pl-3" : "pr-3 justify-end"} h-4 relative`}
         onContextMenu={(e) => openPortMenu(e, port)}
       >
         {isLeft && (
@@ -266,9 +288,9 @@ function DeviceNodeComponent({ id, data, selected }: NodeProps<DeviceNodeType>) 
           />
         )}
         <span
-          className="text-[10px] leading-5 truncate"
+          className="text-[10px] leading-4 truncate"
           style={{ color: SIGNAL_COLORS[port.signalType] }}
-          title={`${displayLabel(port.label)} (${SIGNAL_LABELS[port.signalType]})`}
+          title={`${displayLabel(port.label)} (${SIGNAL_LABELS[port.signalType]})${usbcPowerSuffix(port)}`}
         >
           {displayLabel(port.label)}
         </span>
@@ -304,7 +326,7 @@ function DeviceNodeComponent({ id, data, selected }: NodeProps<DeviceNodeType>) 
     return (
       <div
         key={port.id}
-        className="flex justify-between items-center relative h-5"
+        className="flex justify-between items-center relative h-4"
         onContextMenu={(e) => openPortMenu(e, port)}
       >
         {/* Rear handle — left edge, source (ConnectionMode.Loose; isValidConnection enforces direction) */}
@@ -317,7 +339,7 @@ function DeviceNodeComponent({ id, data, selected }: NodeProps<DeviceNodeType>) 
           style={{ background: signalColor, top: "50%" }}
         />
         <span
-          className="text-[10px] leading-5 truncate px-3 flex-1 text-center"
+          className="text-[10px] leading-4 truncate px-3 flex-1 text-center"
           style={{ color: signalColor }}
           title={`${displayLabel(port.label)} (${signalLabel}) — passthrough`}
         >
@@ -373,12 +395,12 @@ function DeviceNodeComponent({ id, data, selected }: NodeProps<DeviceNodeType>) 
     );
   }
 
-  /** Footer aux block — rows below the port area. Grid-rounded (20-multiple) so device
+  /** Footer aux block — rows below the port area. Grid-rounded (16-multiple) so device
    *  bottom stays on the snap grid. Blank rows render as 6-px separator gaps. */
   function renderFooterAuxBlock(rows: AuxRow[]) {
     if (rows.length === 0) return null;
     const raw = 1 + rows.reduce((sum, r) => sum + auxRowHeight(r), 0);
-    const totalPad = Math.ceil(raw / 20) * 20 - raw;
+    const totalPad = Math.ceil(raw / 16) * 16 - raw;
     const pt = Math.floor(totalPad / 2);
     const pb = totalPad - pt;
     return (
@@ -408,8 +430,8 @@ function DeviceNodeComponent({ id, data, selected }: NodeProps<DeviceNodeType>) 
     );
   }
 
-  /** Header band — label zone + header aux rows, centered together in a 20-multiple band.
-   *  Replaces the old separate 40-px name strip + header aux block: eliminates the ~14-px
+  /** Header band — label zone + header aux rows, centered together in a 16-multiple band.
+   *  Replaces the old separate name strip + header aux block: eliminates the ~14-px
    *  wasted whitespace between the label and the first aux row.
    *
    *  Keep the band-height formula in sync with `headerBandHeight()` in auxiliaryData.ts —
@@ -468,18 +490,18 @@ function DeviceNodeComponent({ id, data, selected }: NodeProps<DeviceNodeType>) 
         relative rounded-lg border bg-white
         ${isOverlapping ? "border-red-400 shadow-lg shadow-red-400/30" : selected ? "border-blue-500 shadow-lg shadow-blue-500/20" : "border-[var(--color-border)]"}
       `}
-      style={{ width: 180 }}
+      style={{ width: 144 }}
     >
-      {/* Header band — merged name strip + header aux rows. Height is always a 20-multiple
-           (min 40) so the first port below stays on the pathfinding grid. */}
+      {/* Header band — merged name strip + header aux rows. Height is always a 16-multiple
+           (min 32) so the first port below stays on the pathfinding grid. */}
       {renderHeaderBand(headerAuxRows)}
 
-      {/* Port area — 8px top padding lands handle centers on the 20px grid:
-           1px (outer top border) + headerBand(20-mult) + 1px (header border-b)
-           + 8px (pt) + 10px (half row) ≡ 0 mod 20.
+      {/* Port area — 6px top padding lands handle centers on the 16px grid:
+           1px (outer top border) + headerBand(16-mult) + 1px (header border-b)
+           + 6px (pt) + 8px (half row) ≡ 0 mod 16.
            The header's `border-b` adds 1px between the band and the port column,
-           which the `pt` value (8 not 9) compensates for. */}
-      <div className="pt-[8px] pb-[9px]">
+           which the `pt` value (6 not 7) compensates for. */}
+      <div className="pt-[6px] pb-[7px]">
       {/* Input/Output Ports — two independent columns */}
       {(leftPorts.length > 0 || rightPorts.length > 0) && (
         hasSections ? (
@@ -489,11 +511,13 @@ function DeviceNodeComponent({ id, data, selected }: NodeProps<DeviceNodeType>) 
             <div className="flex-1 min-w-0">
               {leftItems.map((item, i) =>
                 item.type === "section" ? (
-                  <div key={`lsec-${i}`} className="h-5 flex items-end pl-2">
+                  <div key={`lsec-${i}`} className="h-4 flex items-end pl-2">
                     <span className="text-[9px] text-[var(--color-text-muted)] truncate border-b border-[var(--color-border)]/30 w-full pb-0.5 mr-1">
                       {item.name}
                     </span>
                   </div>
+                ) : item.type === "divider" ? (
+                  renderDivider(`ldiv-${i}`)
                 ) : renderColumnPort(item.port, "left"),
               )}
             </div>
@@ -502,11 +526,13 @@ function DeviceNodeComponent({ id, data, selected }: NodeProps<DeviceNodeType>) 
             <div className="flex-1 min-w-0">
               {rightItems.map((item, i) =>
                 item.type === "section" ? (
-                  <div key={`rsec-${i}`} className="h-5 flex items-end pr-2">
+                  <div key={`rsec-${i}`} className="h-4 flex items-end pr-2">
                     <span className="text-[9px] text-[var(--color-text-muted)] truncate text-right border-b border-[var(--color-border)]/30 w-full pb-0.5 ml-1">
                       {item.name}
                     </span>
                   </div>
+                ) : item.type === "divider" ? (
+                  renderDivider(`rdiv-${i}`)
                 ) : renderColumnPort(item.port, "right"),
               )}
             </div>
@@ -520,7 +546,7 @@ function DeviceNodeComponent({ id, data, selected }: NodeProps<DeviceNodeType>) 
               const lh = left ? handleProps(left, "left") : null;
               const rh = right ? handleProps(right, "right") : null;
               return (
-                <div key={i} className="flex justify-between items-center relative h-5">
+                <div key={i} className="flex justify-between items-center relative h-4">
                   <div className="flex items-center gap-1 pl-3 min-w-0 flex-1" onContextMenu={left ? (e) => openPortMenu(e, left) : undefined}>
                     {left && lh && (
                       <>
@@ -534,9 +560,9 @@ function DeviceNodeComponent({ id, data, selected }: NodeProps<DeviceNodeType>) 
                           style={{ background: SIGNAL_COLORS[left.signalType], top: "50%" }}
                         />
                         <span
-                          className="text-[10px] leading-5 truncate"
+                          className="text-[10px] leading-4 truncate"
                           style={{ color: SIGNAL_COLORS[left.signalType] }}
-                          title={`${displayLabel(left.label)} (${SIGNAL_LABELS[left.signalType]})`}
+                          title={`${displayLabel(left.label)} (${SIGNAL_LABELS[left.signalType]})${usbcPowerSuffix(left)}`}
                         >
                           {displayLabel(left.label)}
                         </span>
@@ -547,9 +573,9 @@ function DeviceNodeComponent({ id, data, selected }: NodeProps<DeviceNodeType>) 
                     {right && rh && (
                       <>
                         <span
-                          className="text-[10px] leading-5 truncate"
+                          className="text-[10px] leading-4 truncate"
                           style={{ color: SIGNAL_COLORS[right.signalType] }}
-                          title={`${displayLabel(right.label)} (${SIGNAL_LABELS[right.signalType]})`}
+                          title={`${displayLabel(right.label)} (${SIGNAL_LABELS[right.signalType]})${usbcPowerSuffix(right)}`}
                         >
                           {displayLabel(right.label)}
                         </span>
@@ -572,11 +598,12 @@ function DeviceNodeComponent({ id, data, selected }: NodeProps<DeviceNodeType>) 
         )
       )}
 
-      {/* Empty Expansion Slots — hidden when slot.hideWhenEmpty (storage media etc.) */}
-      {data.slots?.some((s) => !s.cardTemplateId && !s.hideWhenEmpty) && (
+      {/* Empty Expansion Slots — hidden when slot.hideWhenEmpty (template, storage media
+          etc.) or slot.hidden (per-instance user toggle, #211). */}
+      {data.slots?.some((s) => !s.cardTemplateId && !s.hideWhenEmpty && !s.hidden) && (
         <div>
-          {data.slots.filter((s) => !s.cardTemplateId && !s.hideWhenEmpty).map((slot) => (
-            <div key={slot.slotId} className="flex justify-center items-center h-5 mx-1">
+          {data.slots.filter((s) => !s.cardTemplateId && !s.hideWhenEmpty && !s.hidden).map((slot) => (
+            <div key={slot.slotId} className="flex justify-center items-center h-4 mx-1">
               <span className="text-[9px] text-[var(--color-text-muted)] opacity-40 truncate text-center italic">
                 {displayLabel(slot.label)} (empty)
               </span>
@@ -588,7 +615,7 @@ function DeviceNodeComponent({ id, data, selected }: NodeProps<DeviceNodeType>) 
       {/* Passthrough Ports — one row per circuit, rear handle left, front handle right */}
       {passthroughPorts.length > 0 && (
         <div>
-          <div className="flex h-5">
+          <div className="flex h-4">
             <div className="flex-1 flex items-end pl-2">
               <span className="text-[9px] text-[var(--color-text-muted)] truncate border-b border-[var(--color-border)]/30 w-full pb-0.5 mr-1">
                 Rear
@@ -602,11 +629,13 @@ function DeviceNodeComponent({ id, data, selected }: NodeProps<DeviceNodeType>) 
           </div>
           {passthroughItems.map((item, i) =>
             item.type === "section" ? (
-              <div key={`psec-${i}`} className="flex justify-center items-end h-5 mx-1">
+              <div key={`psec-${i}`} className="flex justify-center items-end h-4 mx-1">
                 <span className="text-[9px] text-[var(--color-text-muted)] pb-0.5 truncate border-b border-[var(--color-border)]/30 w-full text-center">
                   {item.name}
                 </span>
               </div>
+            ) : item.type === "divider" ? (
+              renderDivider(`pdiv-${i}`)
             ) : renderPassthroughPort(item.port),
           )}
         </div>
@@ -618,12 +647,15 @@ function DeviceNodeComponent({ id, data, selected }: NodeProps<DeviceNodeType>) 
           {bidirItems.map((item, i) => {
             if (item.type === "section") {
               return (
-                <div key={`bsec-${i}`} className="flex justify-center items-end h-5 mx-1">
+                <div key={`bsec-${i}`} className="flex justify-center items-end h-4 mx-1">
                   <span className="text-[9px] text-[var(--color-text-muted)] pb-0.5 truncate border-b border-[var(--color-border)]/30 w-full text-center">
                     {item.name}
                   </span>
                 </div>
               );
+            }
+            if (item.type === "divider") {
+              return renderDivider(`bdiv-${i}`);
             }
 
             const port = item.port;
@@ -635,7 +667,7 @@ function DeviceNodeComponent({ id, data, selected }: NodeProps<DeviceNodeType>) 
             const outDisabled = inConnected;
 
             return (
-              <div key={port.id} className="flex justify-center items-center relative h-5">
+              <div key={port.id} className="flex justify-center items-center relative h-4">
                 <Handle
                   type="source"
                   position={Position.Left}
@@ -650,9 +682,9 @@ function DeviceNodeComponent({ id, data, selected }: NodeProps<DeviceNodeType>) 
                   }}
                 />
                 <span
-                  className="text-[10px] leading-5 truncate"
+                  className="text-[10px] leading-4 truncate"
                   style={{ color: SIGNAL_COLORS[port.signalType] }}
-                  title={`${displayLabel(port.label)} (${SIGNAL_LABELS[port.signalType]}) — bidirectional`}
+                  title={`${displayLabel(port.label)} (${SIGNAL_LABELS[port.signalType]}) — bidirectional${usbcPowerSuffix(port)}`}
                 >
                   ↔ {displayLabel(port.label)}
                 </span>
@@ -675,7 +707,7 @@ function DeviceNodeComponent({ id, data, selected }: NodeProps<DeviceNodeType>) 
         </div>
       )}
       {portCountInfo && (
-        <div className="text-center h-5 flex items-center justify-center">
+        <div className="text-center h-4 flex items-center justify-center">
           <span className="text-[9px] text-[var(--color-text-muted)]">
             {portCountInfo.connected} / {portCountInfo.total} IOs connected
           </span>

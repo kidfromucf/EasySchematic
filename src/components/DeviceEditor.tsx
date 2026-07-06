@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo, type DragEvent } from "react";
 import { useSchematicStore } from "../store";
+import { buildBulkSlots } from "../slotBulk";
+import { autoNamePorts } from "../portNaming";
 import {
   SIGNAL_LABELS,
   SIGNAL_COLORS,
@@ -78,6 +80,8 @@ interface PortDraft {
   directAttach?: boolean;
   notes?: string;
   poeDrawW?: number;
+  usbcPowerSourceW?: number;
+  usbcPowerDrawW?: number;
   linkSpeed?: string;
   flipped?: boolean;
   // Passthrough-only fields
@@ -167,6 +171,12 @@ export default function DeviceEditor() {
   // Cost
   const [unitCost, setUnitCost] = useState<number | undefined>(undefined);
 
+  // Commercial / logistics metadata
+  const [serialNumber, setSerialNumber] = useState("");
+  const [note, setNote] = useState("");
+  const [isSpare, setIsSpare] = useState(false);
+  const [procurementSource, setProcurementSource] = useState<DeviceData["procurementSource"]>(undefined);
+
   // Physical dimensions
   const [heightMm, setHeightMm] = useState<number | undefined>(undefined);
   const [widthMm, setWidthMm] = useState<number | undefined>(undefined);
@@ -208,7 +218,12 @@ export default function DeviceEditor() {
   const [draggedPortId, setDraggedPortId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ direction: PortDirection; index: number } | null>(null);
 
-  /* eslint-disable react-hooks/set-state-in-effect -- syncing props to local editor state */
+  /* eslint-disable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps -- syncing props to local editor state */
+  // Keyed on editingNodeId, NOT the node object: re-sync the form only when the
+  // editor opens a different device. Keying on `node` re-ran this on every store
+  // mutation to the node (e.g. adding an expansion slot), wiping unsaved edits to
+  // Name/Manufacturer/ports/etc. (#180). Slots render live from node.data.slots,
+  // so they still update without this effect re-firing.
   useEffect(() => {
     if (!node) return;
     const tpl = node.data.templateId
@@ -226,35 +241,7 @@ export default function DeviceEditor() {
     setCategory(node.data.category ?? tpl?.category ?? "");
     setColor(node.data.color);
     setHeaderColor(node.data.headerColor);
-    setPorts(
-      node.data.ports.map((p) => ({
-        id: p.id,
-        label: p.label,
-        signalType: p.signalType,
-        direction: p.direction,
-        section: p.section,
-        connectorType: p.connectorType,
-        gender: p.gender,
-        networkConfig: p.networkConfig ? { ...p.networkConfig } : undefined,
-        capabilities: p.capabilities ? { ...p.capabilities } : undefined,
-        isMulticable: p.isMulticable,
-        channelCount: p.channelCount,
-        multiConnect: p.multiConnect,
-        directAttach: p.directAttach,
-        notes: p.notes,
-        poeDrawW: p.poeDrawW,
-        linkSpeed: p.linkSpeed,
-        flipped: p.flipped,
-        addressable: p.addressable,
-        rearConnectorType: p.rearConnectorType,
-        rearGender: p.rearGender,
-        frontConnectorType: p.frontConnectorType,
-        frontGender: p.frontGender,
-        inheritsSignal: p.inheritsSignal,
-      })),
-    );
     setShowAllPorts(node.data.showAllPorts ?? false);
-    setHiddenPorts(node.data.hiddenPorts ?? []);
     setPortVisOpen(false);
     setDhcpServer(node.data.dhcpServer ? { ...node.data.dhcpServer } : undefined);
     setPowerDrawW(node.data.powerDrawW);
@@ -264,6 +251,10 @@ export default function DeviceEditor() {
     setPoeBudgetW(node.data.poeBudgetW);
     setPoeDrawW(node.data.poeDrawW);
     setUnitCost(node.data.unitCost);
+    setSerialNumber(node.data.serialNumber ?? "");
+    setNote(node.data.note ?? "");
+    setIsSpare(node.data.isSpare ?? false);
+    setProcurementSource(node.data.procurementSource);
     setHeightMm(node.data.heightMm);
     setWidthMm(node.data.widthMm);
     setDepthMm(node.data.depthMm);
@@ -274,8 +265,57 @@ export default function DeviceEditor() {
     setAdapterVisibility(node.data.adapterVisibility ?? "default");
     setAuxiliaryData(normalizeAuxRows(node.data.auxiliaryData));
     setSearchTermsRaw((node.data.searchTerms ?? []).join(", "));
-  }, [node]);
-  /* eslint-enable react-hooks/set-state-in-effect */
+  }, [editingNodeId]);
+  /* eslint-enable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
+
+  // Ports + hiddenPorts sync on a SEPARATE effect keyed on the live port-id signature,
+  // not just editingNodeId. Slot/card operations (swapCard/addSlot/removeSlot) mutate
+  // node.data.ports directly in the store; without re-syncing here the editor's local
+  // `ports` went stale and handleSave wrote the old list back, wiping a freshly-installed
+  // card's ports (#180). Keeping this off editingNodeId-only also preserves the original
+  // #180 fix — adding a slot adds no ports, so the signature is unchanged and in-progress
+  // text edits (Name/etc., synced above) survive. Unsaved draft ports are carried across
+  // re-syncs of the same device so a card install mid-edit doesn't drop them.
+  const portSignature = node ? node.data.ports.map((p) => p.id).join("|") : "";
+  const syncedPortsNodeRef = useRef<string | null>(null);
+  /* eslint-disable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps -- syncing store ports to local editor state */
+  useEffect(() => {
+    if (!node) return;
+    const synced = node.data.ports.map((p) => ({
+      id: p.id,
+      label: p.label,
+      signalType: p.signalType,
+      direction: p.direction,
+      section: p.section,
+      connectorType: p.connectorType,
+      gender: p.gender,
+      networkConfig: p.networkConfig ? { ...p.networkConfig } : undefined,
+      capabilities: p.capabilities ? { ...p.capabilities } : undefined,
+      isMulticable: p.isMulticable,
+      channelCount: p.channelCount,
+      multiConnect: p.multiConnect,
+      directAttach: p.directAttach,
+      notes: p.notes,
+      poeDrawW: p.poeDrawW,
+      usbcPowerSourceW: p.usbcPowerSourceW,
+      usbcPowerDrawW: p.usbcPowerDrawW,
+      linkSpeed: p.linkSpeed,
+      flipped: p.flipped,
+      addressable: p.addressable,
+      rearConnectorType: p.rearConnectorType,
+      rearGender: p.rearGender,
+      frontConnectorType: p.frontConnectorType,
+      frontGender: p.frontGender,
+      inheritsSignal: p.inheritsSignal,
+    }));
+    const sameNode = syncedPortsNodeRef.current === editingNodeId;
+    syncedPortsNodeRef.current = editingNodeId;
+    setPorts((prev) =>
+      sameNode ? [...synced, ...prev.filter((p) => p.id.startsWith("draft-"))] : synced,
+    );
+    setHiddenPorts(node.data.hiddenPorts ?? []);
+  }, [editingNodeId, portSignature]);
+  /* eslint-enable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
 
   const close = useCallback(() => {
     // Read live store state — a stale closure here would make handleSave
@@ -287,16 +327,23 @@ export default function DeviceEditor() {
       undo();
       setCreatingNodeId(null);
     }
+    // Reset the port-sync session marker so REOPENING this device does a clean
+    // replace from the store instead of merging stale `draft-` ports back in.
+    // The mid-edit draft-carry (#180) only needs the marker WITHIN one session
+    // (a card install while the editor is open); across close/reopen, any drafts
+    // were already either committed (under new IDs) or discarded, so re-merging
+    // them duplicates ports on every Apply→reopen cycle.
+    syncedPortsNodeRef.current = null;
     setEditingNodeId(null);
   }, [undo, setCreatingNodeId, setEditingNodeId]);
 
   const handleSave = useCallback(() => {
     if (!editingNodeId) return;
 
-    // Build old→new ID map for draft ports
+    // Build old→new ID map for draft ports. Unnamed ports are auto-named (not
+    // dropped) so a row you added never silently vanishes on Apply.
     const idMap = new Map<string, string>();
-    const finalPorts: Port[] = ports
-      .filter((p) => p.label.trim())
+    const finalPorts: Port[] = autoNamePorts(ports)
       .map((p, i) => {
         const newId = p.id.startsWith("draft-") ? `p${Date.now()}-${i}` : p.id;
         if (newId !== p.id) idMap.set(p.id, newId);
@@ -339,6 +386,10 @@ export default function DeviceEditor() {
       ...(voltage ? { voltage } : {}),
       ...(thermalBtuh != null ? { thermalBtuh } : {}),
       ...(unitCost != null ? { unitCost } : {}),
+      ...(serialNumber.trim() ? { serialNumber: serialNumber.trim() } : {}),
+      ...(note.trim() ? { note: note.trim() } : {}),
+      ...(isSpare ? { isSpare: true } : {}),
+      ...(procurementSource ? { procurementSource } : {}),
       ...(heightMm != null ? { heightMm } : {}),
       ...(widthMm != null ? { widthMm } : {}),
       ...(depthMm != null ? { depthMm } : {}),
@@ -358,7 +409,7 @@ export default function DeviceEditor() {
     updateDevice(editingNodeId, data);
     setCreatingNodeId(null); // commit the node — close won't undo it
     close();
-  }, [editingNodeId, ports, label, shortName, useShortName, wrapLabel, hostname, deviceType, manufacturer, modelNumber, referenceUrl, category, color, headerColor, node, updateDevice, close, setCreatingNodeId, showAllPorts, hiddenPorts, dhcpServer, powerDrawW, powerCapacityW, voltage, thermalBtuh, poeBudgetW, poeDrawW, unitCost, heightMm, widthMm, depthMm, weightKg, isCableAccessory, integratedWithCable, isVenueProvided, adapterVisibility, auxiliaryData, searchTermsRaw]);
+  }, [editingNodeId, ports, label, shortName, useShortName, wrapLabel, hostname, deviceType, manufacturer, modelNumber, referenceUrl, category, color, headerColor, node, updateDevice, close, setCreatingNodeId, showAllPorts, hiddenPorts, dhcpServer, powerDrawW, powerCapacityW, voltage, thermalBtuh, poeBudgetW, poeDrawW, unitCost, serialNumber, note, isSpare, procurementSource, heightMm, widthMm, depthMm, weightKg, isCableAccessory, integratedWithCable, isVenueProvided, adapterVisibility, auxiliaryData, searchTermsRaw]);
 
   // Ctrl+Enter anywhere in the editor → Apply & Close
   const onCtrlEnter = useCallback((e: React.KeyboardEvent) => {
@@ -596,6 +647,8 @@ export default function DeviceEditor() {
       directAttach: p.directAttach,
       notes: p.notes,
       poeDrawW: p.poeDrawW,
+      usbcPowerSourceW: p.usbcPowerSourceW,
+      usbcPowerDrawW: p.usbcPowerDrawW,
       linkSpeed: p.linkSpeed,
       flipped: p.flipped,
       addressable: p.addressable,
@@ -647,6 +700,8 @@ export default function DeviceEditor() {
       directAttach: p.directAttach,
       notes: p.notes,
       poeDrawW: p.poeDrawW,
+      usbcPowerSourceW: p.usbcPowerSourceW,
+      usbcPowerDrawW: p.usbcPowerDrawW,
       linkSpeed: p.linkSpeed,
       flipped: p.flipped,
       addressable: p.addressable,
@@ -1312,25 +1367,81 @@ export default function DeviceEditor() {
             </div>
           </details>
 
-          {/* Cost */}
+          {/* Cost & Procurement */}
           <details className="text-xs">
             <summary className="cursor-pointer text-[var(--color-text-secondary)] hover:text-[var(--color-text)] select-none py-1">
-              Cost
+              Cost & Procurement
             </summary>
-            <div className="pt-1 pl-2" style={{ maxWidth: "50%" }}>
-              <label className="block text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-0.5">
-                Unit Cost ({currency})
+            <div className="pt-1 pl-2 flex flex-col gap-2">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-0.5">
+                    Unit Cost ({currency})
+                  </label>
+                  <input
+                    type="number"
+                    className="w-full bg-[var(--color-surface)] border border-[var(--color-border)] rounded px-2 py-1 text-xs outline-none focus:border-blue-500"
+                    value={unitCost ?? ""}
+                    onChange={(e) => setUnitCost(e.target.value ? Number(e.target.value) : undefined)}
+                    placeholder="0.00"
+                    min={0}
+                    step={0.01}
+                    onKeyDown={(e) => e.stopPropagation()}
+                  />
+                </div>
+                <div>
+                  <label className="block text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-0.5">
+                    Serial Number
+                  </label>
+                  <input
+                    type="text"
+                    className="w-full bg-[var(--color-surface)] border border-[var(--color-border)] rounded px-2 py-1 text-xs outline-none focus:border-blue-500"
+                    value={serialNumber}
+                    onChange={(e) => setSerialNumber(e.target.value)}
+                    placeholder="e.g. SN-00123"
+                    onKeyDown={(e) => e.stopPropagation()}
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="block text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-0.5">
+                  Source
+                </label>
+                <select
+                  className="w-full bg-[var(--color-surface)] border border-[var(--color-border)] rounded px-2 py-1 text-xs outline-none focus:border-blue-500 cursor-pointer"
+                  value={procurementSource ?? ""}
+                  onChange={(e) => setProcurementSource((e.target.value || undefined) as DeviceData["procurementSource"])}
+                >
+                  <option value="">—</option>
+                  <option value="stock">Own stock</option>
+                  <option value="procuring">Being procured</option>
+                  <option value="contractor">Other contractor</option>
+                </select>
+              </div>
+              <label className="flex items-center gap-1.5 text-[11px] text-[var(--color-text)] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={isSpare}
+                  onChange={(e) => setIsSpare(e.target.checked)}
+                />
+                Cold spare
               </label>
-              <input
-                type="number"
-                className="w-full bg-[var(--color-surface)] border border-[var(--color-border)] rounded px-2 py-1 text-xs outline-none focus:border-blue-500"
-                value={unitCost ?? ""}
-                onChange={(e) => setUnitCost(e.target.value ? Number(e.target.value) : undefined)}
-                placeholder="0.00"
-                min={0}
-                step={0.01}
-                onKeyDown={(e) => e.stopPropagation()}
-              />
+              <div>
+                <label className="block text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-0.5">
+                  Note
+                </label>
+                <textarea
+                  className="w-full bg-[var(--color-surface)] border border-[var(--color-border)] rounded px-2 py-1 text-xs outline-none focus:border-blue-500 resize-y"
+                  value={note}
+                  onChange={(e) => setNote(e.target.value)}
+                  placeholder="Free-text note"
+                  rows={2}
+                  onKeyDown={(e) => e.stopPropagation()}
+                />
+                <p className="text-[10px] text-[var(--color-text-muted)] mt-0.5">
+                  Shows in the pack list / device report.
+                </p>
+              </div>
             </div>
           </details>
 
@@ -1714,6 +1825,95 @@ function BulkAddForm({
   );
 }
 
+function BulkAddSlotsForm({
+  nodeId,
+  defaultStart,
+  onBulkAdd,
+  onClose,
+}: {
+  nodeId: string;
+  defaultStart: number;
+  onBulkAdd: (prefix: string, start: number, count: number, slotFamily: string) => void;
+  onClose: () => void;
+}) {
+  const [prefix, setPrefix] = useState("Slot");
+  const [start, setStart] = useState(defaultStart);
+  const [end, setEnd] = useState(defaultStart + 3);
+  const [slotFamily, setSlotFamily] = useState("");
+
+  const handleSubmit = () => {
+    const count = end - start + 1;
+    if (count < 1 || !prefix.trim()) return;
+    onBulkAdd(prefix.trim(), start, count, slotFamily.trim());
+    onClose();
+  };
+
+  return (
+    <div className="bg-[var(--color-surface)] border border-[var(--color-border)] rounded p-2 space-y-2">
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <input
+          className="w-20 bg-[var(--color-surface)] text-[var(--color-text-heading)] border border-[var(--color-border)] rounded px-1.5 py-1 text-xs outline-none focus:border-blue-500"
+          value={prefix}
+          onChange={(e) => setPrefix(e.target.value)}
+          placeholder="Prefix"
+          onKeyDown={(e) => e.stopPropagation()}
+        />
+        <div className="flex items-center gap-0.5">
+          <span className="text-[10px] text-[var(--color-text-muted)]">from</span>
+          <input
+            type="number"
+            className="w-12 bg-[var(--color-surface)] text-[var(--color-text-heading)] border border-[var(--color-border)] rounded px-1.5 py-1 text-xs outline-none focus:border-blue-500"
+            value={start}
+            onChange={(e) => setStart(parseInt(e.target.value) || 1)}
+            min={0}
+            onKeyDown={(e) => e.stopPropagation()}
+          />
+        </div>
+        <div className="flex items-center gap-0.5">
+          <span className="text-[10px] text-[var(--color-text-muted)]">to</span>
+          <input
+            type="number"
+            className="w-12 bg-[var(--color-surface)] text-[var(--color-text-heading)] border border-[var(--color-border)] rounded px-1.5 py-1 text-xs outline-none focus:border-blue-500"
+            value={end}
+            onChange={(e) => setEnd(parseInt(e.target.value) || 1)}
+            min={start}
+            max={999}
+            onKeyDown={(e) => e.stopPropagation()}
+          />
+        </div>
+      </div>
+      <div className="flex items-center gap-1.5">
+        <span className="text-[10px] text-[var(--color-text-muted)]">Family:</span>
+        <input
+          className="flex-1 bg-[var(--color-surface)] text-[var(--color-text-heading)] border border-[var(--color-border)] rounded px-1.5 py-1 text-xs outline-none focus:border-blue-500"
+          value={slotFamily}
+          onChange={(e) => setSlotFamily(e.target.value)}
+          placeholder="(optional, e.g. yamaha-my)"
+          list={`slot-families-${nodeId}`}
+          onKeyDown={(e) => e.stopPropagation()}
+        />
+      </div>
+      <div className="flex items-center gap-1.5">
+        <button
+          onClick={handleSubmit}
+          className="px-2 py-1 text-xs rounded bg-blue-600 text-white hover:bg-blue-500 transition-colors cursor-pointer"
+        >
+          Add {Math.max(0, end - start + 1)}
+        </button>
+        <button
+          onClick={onClose}
+          className="px-2 py-1 text-xs rounded bg-[var(--color-surface)] text-[var(--color-text-muted)] hover:text-[var(--color-text)] border border-[var(--color-border)] transition-colors cursor-pointer"
+        >
+          Cancel
+        </button>
+        <span className="text-[10px] text-[var(--color-text-muted)]">
+          {prefix} {start} … {prefix} {end}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 function PortVisibilitySection({
   showAllPorts,
   setShowAllPorts,
@@ -1990,6 +2190,15 @@ function PortSection({
                   }}
                 />
               ))}
+              {/* Close a section that runs into unsectioned ports, so the next
+                  port doesn't read as part of this section. A following section
+                  needs nothing — its own header is the boundary. */}
+              {group.section && groups[gi + 1] && !groups[gi + 1].section && (
+                <div
+                  className="border-b border-[var(--color-border)]/30 mx-1 mt-1 mb-0.5"
+                  aria-hidden
+                />
+              )}
             </div>
           );
         })}
@@ -2477,6 +2686,33 @@ function PortRow({
         </>
       )}
 
+      {/* USB-C Power Delivery (per-port — USB-C doesn't pool a shared budget like PoE) */}
+      {port.connectorType === "usb-c" && (
+        <div className="pl-6 mb-0.5 flex items-center gap-1.5">
+          <span className="text-[9px] text-[var(--color-text-muted)] shrink-0">USB-C PD (W):</span>
+          <input
+            className="w-20 bg-[var(--color-surface)] border border-[var(--color-border)] rounded px-1.5 py-0.5 text-[10px] outline-none focus:border-blue-500"
+            type="number"
+            value={port.usbcPowerSourceW ?? ""}
+            onChange={(e) => onUpdate({ usbcPowerSourceW: e.target.value ? Number(e.target.value) : undefined })}
+            placeholder="Delivers"
+            min={0}
+            onKeyDown={(e) => e.stopPropagation()}
+            title="Watts this port can deliver (source — charger, dock, laptop)"
+          />
+          <input
+            className="w-20 bg-[var(--color-surface)] border border-[var(--color-border)] rounded px-1.5 py-0.5 text-[10px] outline-none focus:border-blue-500"
+            type="number"
+            value={port.usbcPowerDrawW ?? ""}
+            onChange={(e) => onUpdate({ usbcPowerDrawW: e.target.value ? Number(e.target.value) : undefined })}
+            placeholder="Draws"
+            min={0}
+            onKeyDown={(e) => e.stopPropagation()}
+            title="Watts this port consumes (sink — bus-powered device)"
+          />
+        </div>
+      )}
+
       {/* Capabilities (collapsible, only for video signal types) */}
       {VIDEO_SIGNAL_TYPES.has(port.signalType) && (
         <PortCapabilitiesSection
@@ -2721,12 +2957,15 @@ function SlotEditSection({
 }) {
   const swapCard = useSchematicStore((s) => s.swapCard);
   const addSlot = useSchematicStore((s) => s.addSlot);
+  const addSlots = useSchematicStore((s) => s.addSlots);
   const updateSlot = useSchematicStore((s) => s.updateSlot);
   const removeSlot = useSchematicStore((s) => s.removeSlot);
   const edges = useSchematicStore((s) => s.edges);
   const customTemplates = useSchematicStore((s) => s.customTemplates);
 
   const [creatingCardForSlot, setCreatingCardForSlot] = useState<string | null>(null);
+  const [showBulkAdd, setShowBulkAdd] = useState(false);
+  const topLevelCount = installedSlots.filter((s) => !s.parentSlotId).length;
 
   const knownFamilies = useMemo(
     () => [
@@ -2744,16 +2983,35 @@ function SlotEditSection({
     <div className="space-y-2">
       <div className="flex items-center justify-between">
         <div className="text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] font-medium">
-          Expansion Slots{installedSlots.length > 0 ? ` (${installedSlots.filter((s) => !s.parentSlotId).length})` : ""}
+          Expansion Slots{installedSlots.length > 0 ? ` (${topLevelCount})` : ""}
         </div>
-        <button
-          type="button"
-          onClick={() => addSlot(nodeId, { label: `Slot ${installedSlots.filter((s) => !s.parentSlotId).length + 1}`, slotFamily: "" })}
-          className="text-[10px] text-blue-600 hover:text-blue-700 cursor-pointer"
-        >
-          + Add Slot
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => addSlot(nodeId, { label: `Slot ${topLevelCount + 1}`, slotFamily: "" })}
+            className="text-[10px] text-blue-600 hover:text-blue-700 cursor-pointer"
+          >
+            + Add Slot
+          </button>
+          <button
+            type="button"
+            onClick={() => setShowBulkAdd((v) => !v)}
+            className="text-[10px] text-blue-600 hover:text-blue-700 cursor-pointer"
+          >
+            + Bulk Add
+          </button>
+        </div>
       </div>
+      {showBulkAdd && (
+        <BulkAddSlotsForm
+          nodeId={nodeId}
+          defaultStart={topLevelCount + 1}
+          onBulkAdd={(prefix, start, count, slotFamily) =>
+            addSlots(nodeId, buildBulkSlots(prefix, start, count, slotFamily))
+          }
+          onClose={() => setShowBulkAdd(false)}
+        />
+      )}
       {installedSlots.length === 0 && (
         <div className="text-[10px] text-[var(--color-text-muted)] italic">
           No expansion slots. Add a slot for devices with modular card bays.
@@ -2768,9 +3026,12 @@ function SlotEditSection({
         const familyCards = family ? getCardsByFamily(family, customTemplates) : [];
         const isNested = !!slot.parentSlotId;
 
-        // Count connections to this slot's ports (including descendant ports for parent slots)
+        // Count connections to this slot's ports (including descendant ports for parent slots).
+        // Match descendants on whole path segments, not a raw prefix, so a sibling whose id
+        // merely starts with this one (e.g. "p1" vs "p10/...") isn't counted here. (Mirrors the
+        // descendant match in swapCard / removeSlot.)
         const descendantPortIds = isNested ? [] : installedSlots
-          .filter((s) => s.parentSlotId?.startsWith(slot.slotId))
+          .filter((s) => !!s.parentSlotId && (s.parentSlotId === slot.slotId || s.parentSlotId.startsWith(`${slot.slotId}/`)))
           .flatMap((s) => s.portIds);
         const allPortIds = new Set([...slot.portIds, ...descendantPortIds]);
         const connCount = edges.filter((e) => {
@@ -2805,6 +3066,29 @@ function SlotEditSection({
                   placeholder="family"
                   className="w-24 bg-[var(--color-surface)] text-[var(--color-text-heading)] border border-[var(--color-border)] rounded px-1.5 py-0.5 text-[10px] outline-none focus:border-blue-500"
                 />
+                {/* Hide toggle — only meaningful for an empty slot (its "(empty)" bay row
+                    on the canvas). Populated slots show via their ports instead. (#211) */}
+                {!slot.cardTemplateId && (
+                  <button
+                    type="button"
+                    onClick={() => updateSlot(nodeId, slot.slotId, { hidden: !slot.hidden })}
+                    className="shrink-0 cursor-pointer px-0.5"
+                    title={slot.hidden ? "Show empty slot on the device" : "Hide empty slot on the device"}
+                  >
+                    {slot.hidden ? (
+                      <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 text-[var(--color-text-muted)]" fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M2 2l12 12" />
+                        <path d="M6.5 6.5a2 2 0 0 0 2.8 2.8" />
+                        <path d="M4.2 4.2C3 5.1 2 6.4 2 8c1.3 3 3.5 5 6 5 1.2 0 2.3-.4 3.3-1.2M13.4 11.4C14.6 10.4 15.3 9.2 16 8c-1.3-3-3.5-5-6-5-.7 0-1.4.1-2 .4" />
+                      </svg>
+                    ) : (
+                      <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 text-[var(--color-text)]" fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M2 8c1.3-3 3.5-5 6-5s4.7 2 6 5c-1.3 3-3.5 5-6 5S3.3 11 2 8z" />
+                        <circle cx="8" cy="8" r="2" />
+                      </svg>
+                    )}
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => {

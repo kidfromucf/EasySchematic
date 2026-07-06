@@ -6,6 +6,7 @@ export const DEVICE_TYPE_TO_CATEGORY: Record<string, string> = {
   "graphics": "Sources",
   "computer": "Sources",
   "media-player": "Sources",
+  "pattern-generator": "Sources",
   "mouse": "Peripherals",
   "keyboard": "Peripherals",
   "video-bar": "Codecs",
@@ -31,6 +32,7 @@ export const DEVICE_TYPE_TO_CATEGORY: Record<string, string> = {
   "audio-interface": "Audio I/O",
   "audio-dsp": "Audio",
   "equalizer": "Audio",
+  "synthesizer": "Audio",
   "stage-box": "Audio I/O",
   "audio-splitter": "Audio I/O",
   "wireless-mic-receiver": "Microphones",
@@ -58,6 +60,7 @@ export const DEVICE_TYPE_TO_CATEGORY: Record<string, string> = {
   "dmx-splitter": "Lighting",
   "dmx-node": "Lighting",
   "control-processor": "Control",
+  "gateway": "Control",
   "tally-system": "Control",
   "ptz-controller": "Control",
   "sync-generator": "Control",
@@ -107,6 +110,11 @@ export const DEVICE_TYPE_TO_CATEGORY: Record<string, string> = {
   "conference-system": "Audio",
   "di-box": "Audio",
   "display": "Displays",
+  "charging-station": "Microphones",
+  "audio-bar": "Audio",
+  "mtr-pc": "Codecs",
+  "touch-controller": "Control",
+  "occupancy-sensor": "Control",
 };
 
 /** Human-readable labels for device types (kebab-case → Title Case with known acronyms) */
